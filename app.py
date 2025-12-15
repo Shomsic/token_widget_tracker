@@ -369,6 +369,11 @@ class TokenWidget:
             self.theme = self.THEME_DARK
             self.miniature_mode = False
             self.notify_enabled = True
+        
+        # Если total == 0, загружаем историю из файла истории (восстановление при первом запуске)
+        if self.total_session == 0:
+            self.total_session = self.load_history_total()
+        
         self.current_model = None
         self.multiplier = 1.0
         self.input_raw = 0
@@ -379,6 +384,30 @@ class TokenWidget:
         self.output_st = 0
         self.cache_create_st = 0
         self.cache_read_st = 0
+        
+        # Отслеживание предыдущих значений для обнаружения новых токенов
+        self.prev_input_st = 0
+        self.prev_output_st = 0
+        self.prev_cache_create_st = 0
+        self.prev_cache_read_st = 0
+        self.last_session_id = None
+    
+    def load_history_total(self):
+        """Загружает общее количество токенов из файла истории"""
+        history_file = os.path.join(os.path.expanduser("~"), ".token_history.json")
+        total = 0
+        
+        try:
+            if os.path.exists(history_file):
+                with open(history_file, "r") as f:
+                    history = json.load(f)
+                    # Суммируем все токены из истории по всем датам
+                    for date, data in history.items():
+                        total += data.get("tokens", 0)
+        except:
+            pass
+        
+        return total
     
     def save_data(self):
         with open(self.config_file, "w") as f:
@@ -502,6 +531,9 @@ class TokenWidget:
             if not session_file:
                 return
             
+            # Получаем ID сессии чтобы обнаружить смену сессии
+            session_id = os.path.basename(session_file)
+            
             with open(session_file, "r") as f:
                 data = json.load(f)
                 
@@ -520,10 +552,36 @@ class TokenWidget:
                 self.cache_create_raw = cache_create
                 self.cache_read_raw = cache_read
                 
-                self.input_st = int(input_tokens * self.multiplier)
-                self.output_st = int(output_tokens * self.multiplier)
-                self.cache_create_st = int(cache_create * self.multiplier / 10)
-                self.cache_read_st = int(cache_read * self.multiplier / 10)
+                new_input_st = int(input_tokens * self.multiplier)
+                new_output_st = int(output_tokens * self.multiplier)
+                new_cache_create_st = int(cache_create * self.multiplier / 10)
+                new_cache_read_st = int(cache_read * self.multiplier / 10)
+                
+                # Если сессия изменилась, добавляем накопленные токены из старой сессии
+                if session_id != self.last_session_id and self.last_session_id is not None:
+                    accumulated = self.input_st + self.output_st + self.cache_create_st + self.cache_read_st
+                    self.total_session += accumulated
+                    self.save_data()
+                
+                # Если текущая сессия совпадает с предыдущей, проверяем увеличение токенов
+                elif session_id == self.last_session_id:
+                    # Проверяем, увеличились ли значения (это значит, что прошла новая запрос)
+                    if new_input_st > self.input_st or new_output_st > self.output_st or \
+                       new_cache_create_st > self.cache_create_st or new_cache_read_st > self.cache_read_st:
+                        # Добавляем разницу к общему счетчику
+                        delta_input = new_input_st - self.input_st
+                        delta_output = new_output_st - self.output_st
+                        delta_cache_create = new_cache_create_st - self.cache_create_st
+                        delta_cache_read = new_cache_read_st - self.cache_read_st
+                        
+                        self.total_session += delta_input + delta_output + delta_cache_create + delta_cache_read
+                        self.save_data()
+                
+                self.input_st = new_input_st
+                self.output_st = new_output_st
+                self.cache_create_st = new_cache_create_st
+                self.cache_read_st = new_cache_read_st
+                self.last_session_id = session_id
                 
                 self.update_display()
         except:
@@ -549,7 +607,10 @@ class TokenWidget:
         elif self.current_model and "gpt" in self.current_model.lower():
             model_short = "GPT"
         
-        total_st = self.input_st + self.output_st + self.cache_create_st + self.cache_read_st + self.total_session
+        # total_session уже содержит накопленные токены из предыдущих сессий
+        # current_session содержит токены из текущей активной сессии
+        current_session = self.input_st + self.output_st + self.cache_create_st + self.cache_read_st
+        total_st = self.total_session + current_session
         percent = (total_st / self.MONTHLY_LIMIT) * 100
         
         if not hasattr(self, 'total_label') and not hasattr(self, 'percent_label'):
