@@ -2,10 +2,9 @@ import tkinter as tk
 from tkinter import font, messagebox
 import json
 import os
-from datetime import datetime, timedelta
+from datetime import datetime
 import threading
 import subprocess
-import winreg
 import sys
 
 # Проверяем наличие psutil, если нет - устанавливаем
@@ -219,6 +218,7 @@ class TokenWidget:
         self.create_ui()
         self.update_display()
         self.schedule_refresh()
+        self.setup_tray()
     
     def create_ui(self):
         for widget in self.main_frame.winfo_children():
@@ -432,13 +432,12 @@ class TokenWidget:
             else:
                 history = {}
             
-            total_st = self.input_st + self.output_st + self.cache_create_st + self.cache_read_st
+            total_st = self.total_session
             
             if today not in history:
-                history[today] = {"sessions": 0, "tokens": 0}
-            
-            history[today]["tokens"] += total_st
-            history[today]["sessions"] += 1
+                history[today] = {"tokens": total_st}
+            else:
+                history[today]["tokens"] = total_st
             
             with open(history_file, "w") as f:
                 json.dump(history, f)
@@ -446,14 +445,16 @@ class TokenWidget:
             pass
     
     def check_limit_warning(self):
-        total_st = self.input_st + self.output_st + self.cache_create_st + self.cache_read_st
+        total_st = self.total_session
         percent = (total_st / self.MONTHLY_LIMIT) * 100
         
-        if self.notify_enabled:
-            if percent >= 90 and percent < 95:
-                self.show_notification("⚠️ Внимание!", f"Использовано {percent:.1f}% лимита токенов!")
-            elif percent >= 95:
+        if self.notify_enabled and not getattr(self, '_warning_shown', False):
+            if percent >= 95:
                 self.show_notification("🚨 Критично!", f"Использовано {percent:.1f}% лимита! Скоро закончатся токены!")
+                self._warning_shown = True
+            elif percent >= 90:
+                self.show_notification("⚠️ Внимание!", f"Использовано {percent:.1f}% лимита токенов!")
+                self._warning_shown = True
     
     def show_notification(self, title, message):
         try:
@@ -488,7 +489,7 @@ class TokenWidget:
     
     def copy_to_clipboard(self):
         try:
-            total_st = self.input_st + self.output_st + self.cache_create_st + self.cache_read_st
+            total_st = self.total_session
             percent = (total_st / self.MONTHLY_LIMIT) * 100
             
             text = f"Token Tracker: {total_st:,} ST ({percent:.2f}% лимита)"
@@ -500,92 +501,97 @@ class TokenWidget:
         except Exception as e:
             messagebox.showerror("Ошибка", f"Не удалось скопировать: {e}")
     
-    def get_latest_session(self):
+    def calculate_session_tokens(self, session_file):
+        """Рассчитать ST для одной сессии"""
+        try:
+            with open(session_file, "r") as f:
+                data = json.load(f)
+            
+            token_usage = data.get("tokenUsage", {})
+            if not token_usage:
+                return 0, None, {}
+            
+            model = data.get("model", "unknown")
+            multiplier = self.MODEL_MULTIPLIERS.get(model, 1.0)
+            
+            input_tokens = token_usage.get("inputTokens", 0)
+            output_tokens = token_usage.get("outputTokens", 0)
+            cache_create = token_usage.get("cacheCreationTokens", 0)
+            cache_read = token_usage.get("cacheReadTokens", 0)
+            
+            input_st = int(input_tokens * multiplier)
+            output_st = int(output_tokens * multiplier)
+            cache_create_st = int(cache_create * multiplier / 10)
+            cache_read_st = int(cache_read * multiplier / 10)
+            
+            total_st = input_st + output_st + cache_create_st + cache_read_st
+            
+            raw_data = {
+                "input": input_tokens,
+                "output": output_tokens,
+                "cache_create": cache_create,
+                "cache_read": cache_read,
+                "input_st": input_st,
+                "output_st": output_st,
+                "cache_create_st": cache_create_st,
+                "cache_read_st": cache_read_st
+            }
+            
+            return total_st, model, raw_data
+        except:
+            return 0, None, {}
+    
+    def calculate_all_sessions(self):
+        """Просканировать все сессии Factory и посчитать общую сумму ST"""
+        total = 0
+        latest_time = 0
+        latest_model = None
+        latest_raw = {}
+        
         try:
             if not os.path.exists(self.sessions_dir):
-                return None
+                return 0, None, {}
             
-            latest_time = 0
-            latest_file = None
-            
-            for root_dir in os.listdir(self.sessions_dir):
-                full_path = os.path.join(self.sessions_dir, root_dir)
-                if not os.path.isdir(full_path):
+            for project_dir in os.listdir(self.sessions_dir):
+                project_path = os.path.join(self.sessions_dir, project_dir)
+                if not os.path.isdir(project_path):
                     continue
                 
-                for file in os.listdir(full_path):
+                for file in os.listdir(project_path):
                     if file.endswith(".settings.json"):
-                        file_path = os.path.join(full_path, file)
+                        file_path = os.path.join(project_path, file)
+                        session_st, model, raw_data = self.calculate_session_tokens(file_path)
+                        total += session_st
+                        
                         mod_time = os.path.getmtime(file_path)
                         if mod_time > latest_time:
                             latest_time = mod_time
-                            latest_file = file_path
-            
-            return latest_file
-        except:
-            return None
-    
-    def refresh_sessions(self):
-        try:
-            session_file = self.get_latest_session()
-            if not session_file:
-                return
-            
-            # Получаем ID сессии чтобы обнаружить смену сессии
-            session_id = os.path.basename(session_file)
-            
-            with open(session_file, "r") as f:
-                data = json.load(f)
-                
-                model = data.get("model", "unknown")
-                self.current_model = model
-                self.multiplier = self.MODEL_MULTIPLIERS.get(model, 1.0)
-                
-                token_usage = data.get("tokenUsage", {})
-                input_tokens = token_usage.get("inputTokens", 0)
-                output_tokens = token_usage.get("outputTokens", 0)
-                cache_create = token_usage.get("cacheCreationTokens", 0)
-                cache_read = token_usage.get("cacheReadTokens", 0)
-                
-                self.input_raw = input_tokens
-                self.output_raw = output_tokens
-                self.cache_create_raw = cache_create
-                self.cache_read_raw = cache_read
-                
-                new_input_st = int(input_tokens * self.multiplier)
-                new_output_st = int(output_tokens * self.multiplier)
-                new_cache_create_st = int(cache_create * self.multiplier / 10)
-                new_cache_read_st = int(cache_read * self.multiplier / 10)
-                
-                # Если сессия изменилась, добавляем накопленные токены из старой сессии
-                if session_id != self.last_session_id and self.last_session_id is not None:
-                    accumulated = self.input_st + self.output_st + self.cache_create_st + self.cache_read_st
-                    self.total_session += accumulated
-                    self.save_data()
-                
-                # Если текущая сессия совпадает с предыдущей, проверяем увеличение токенов
-                elif session_id == self.last_session_id:
-                    # Проверяем, увеличились ли значения (это значит, что прошла новая запрос)
-                    if new_input_st > self.input_st or new_output_st > self.output_st or \
-                       new_cache_create_st > self.cache_create_st or new_cache_read_st > self.cache_read_st:
-                        # Добавляем разницу к общему счетчику
-                        delta_input = new_input_st - self.input_st
-                        delta_output = new_output_st - self.output_st
-                        delta_cache_create = new_cache_create_st - self.cache_create_st
-                        delta_cache_read = new_cache_read_st - self.cache_read_st
-                        
-                        self.total_session += delta_input + delta_output + delta_cache_create + delta_cache_read
-                        self.save_data()
-                
-                self.input_st = new_input_st
-                self.output_st = new_output_st
-                self.cache_create_st = new_cache_create_st
-                self.cache_read_st = new_cache_read_st
-                self.last_session_id = session_id
-                
-                self.update_display()
+                            latest_model = model
+                            latest_raw = raw_data
         except:
             pass
+        
+        return total, latest_model, latest_raw
+    
+    def refresh_sessions(self):
+        """Обновить данные из всех сессий"""
+        total_st, model, raw_data = self.calculate_all_sessions()
+        
+        self.total_session = total_st
+        self.current_model = model
+        self.multiplier = self.MODEL_MULTIPLIERS.get(model, 1.0) if model else 1.0
+        
+        if raw_data:
+            self.input_raw = raw_data.get("input", 0)
+            self.output_raw = raw_data.get("output", 0)
+            self.cache_create_raw = raw_data.get("cache_create", 0)
+            self.cache_read_raw = raw_data.get("cache_read", 0)
+            self.input_st = raw_data.get("input_st", 0)
+            self.output_st = raw_data.get("output_st", 0)
+            self.cache_create_st = raw_data.get("cache_create_st", 0)
+            self.cache_read_st = raw_data.get("cache_read_st", 0)
+        
+        self.update_display()
     
     def reset(self):
         self.total_session = 0
@@ -607,10 +613,8 @@ class TokenWidget:
         elif self.current_model and "gpt" in self.current_model.lower():
             model_short = "GPT"
         
-        # total_session уже содержит накопленные токены из предыдущих сессий
-        # current_session содержит токены из текущей активной сессии
-        current_session = self.input_st + self.output_st + self.cache_create_st + self.cache_read_st
-        total_st = self.total_session + current_session
+        # total_session содержит сумму всех сессий Factory
+        total_st = self.total_session
         percent = (total_st / self.MONTHLY_LIMIT) * 100
         
         if not hasattr(self, 'total_label') and not hasattr(self, 'percent_label'):
@@ -742,13 +746,12 @@ class TokenWidget:
     def on_click(self, event):
         self.drag_data["x"] = event.x_root - self.root.winfo_x()
         self.drag_data["y"] = event.y_root - self.root.winfo_y()
-        self.root.after(300, self.check_double_click)
-        self.last_click_time = self.root.tk.call('clock', 'clicks', '-milliseconds')
-    
-    def check_double_click(self):
         current_time = self.root.tk.call('clock', 'clicks', '-milliseconds')
-        if hasattr(self, 'last_click_time') and (current_time - self.last_click_time) < 300:
+        if hasattr(self, '_last_click_time') and (current_time - self._last_click_time) < 400:
             self.toggle_mode()
+            self._last_click_time = 0
+        else:
+            self._last_click_time = current_time
     
     def on_drag(self, event):
         x = event.x_root - self.drag_data["x"]
@@ -873,7 +876,7 @@ class TokenWidget:
         at_bottom = (old_y + old_h) > (screen_h - 10)
         
         self.miniature_mode = not self.miniature_mode
-        self.compact_mode = self.miniature_mode and False or not self.miniature_mode
+        self.compact_mode = not self.miniature_mode
         
         if self.miniature_mode:
             w, h = 50, 50
@@ -909,7 +912,9 @@ class TokenWidget:
     def reset_position(self):
         self.current_x = 50
         self.current_y = 50
-        if self.compact_mode:
+        if self.miniature_mode:
+            self.root.geometry(f"50x50+{self.current_x}+{self.current_y}")
+        elif self.compact_mode:
             self.root.geometry(f"170x150+{self.current_x}+{self.current_y}")
         else:
             self.root.geometry(f"420x480+{self.current_x}+{self.current_y}")
